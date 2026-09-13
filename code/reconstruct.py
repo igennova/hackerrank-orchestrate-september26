@@ -405,12 +405,13 @@ class RecurringSeries:
     category: str
     direction: str
     event_type: str
-    kind: str  # "monthly" | "daily_drip" | "one_off"
+    kind: str  # "monthly" | "periodic" | "daily_drip" | "one_off"
     occurrences: int
     day_of_month: Optional[int]  # monthly only
     median_gap_days: Optional[float]
-    projected_amount: Optional[float]  # per-occurrence (monthly) or per-day (drip)
+    projected_amount: Optional[float]  # per-occurrence (monthly/periodic) or per-day (drip)
     amount_basis: str  # human note: how projected_amount was derived
+    period_days: Optional[int] = None  # periodic only: recur every N days
     cashflows: List[Cashflow] = field(default_factory=list)
 
 
@@ -493,31 +494,32 @@ def detect_recurrence(
 
         kind = "one_off"
         day_of_month: Optional[int] = None
+        period_days: Optional[int] = None
         projected_amount: Optional[float] = None
         amount_basis = "one-off; carried at own date"
 
-        if n >= MIN_OCCURRENCES and median_gap is not None:
-            is_monthly = (
-                MONTHLY_GAP_MIN <= median_gap <= MONTHLY_GAP_MAX
-                and modal_count / n >= MONTHLY_DOM_CONSISTENCY
-            )
-            # Should this non-monthly series drip? Expenses always do (they
-            # continue unless evidence they stop). Income drips only under policy
-            # A and only when near-daily (evidence of ongoing frequent income).
-            if is_monthly:
-                is_drip = False
-            elif direction == "debit":
-                is_drip = True  # DECISION 2: expenses continue -> drip monthly avg
-            else:  # income
-                is_drip = (
-                    income_policy == "A"
-                    and median_gap <= DRIP_GAP_MAX
-                    and n >= DRIP_MIN_OCCURRENCES
+        is_income = direction == "credit"
+        # Salary-like income can be trusted as recurring on thinner evidence.
+        is_salary_like = is_income and (category == "salary" or event_type == "income")
+
+        if median_gap is not None:
+            # Monthly detection. CHANGE 1: salary/regular income counts as monthly
+            # with only 2 records ~a month apart (fixes under-projection when few
+            # salary rows are visible); expenses still need >=3.
+            if n >= MIN_OCCURRENCES:
+                is_monthly = (
+                    MONTHLY_GAP_MIN <= median_gap <= MONTHLY_GAP_MAX
+                    and modal_count / n >= MONTHLY_DOM_CONSISTENCY
                 )
+            elif n == 2 and is_salary_like:
+                is_monthly = MONTHLY_GAP_MIN <= median_gap <= MONTHLY_GAP_MAX
+            else:
+                is_monthly = False
 
             if is_monthly:
                 kind = "monthly"
-                day_of_month = modal_dom
+                # Prefer the most recent occurrence's day for the thin 2-record case.
+                day_of_month = modal_dom if n >= MIN_OCCURRENCES else dates[-1].day
                 recent = _recent_amounts(cfs_sorted, RECENT_N)
                 if recent and len({round(a, 2) for a in recent}) == 1:
                     projected_amount = recent[0]
@@ -527,13 +529,33 @@ def detect_recurrence(
                     amount_basis = f"mean of {len(recent)} recent occurrences"
                 else:
                     amount_basis = "amount unresolved (blank occurrences)"
-            elif is_drip:
+            elif direction == "debit" and n >= MIN_OCCURRENCES:
+                # DECISION 2: expenses continue unless evidence they stop -> drip.
                 kind = "daily_drip"
                 monthly_total = _monthly_total_recent(cfs_sorted, RECENT_N)
                 projected_amount = monthly_total / DAYS_PER_MONTH
                 amount_basis = (
                     f"mean monthly total {monthly_total:.2f} over recent "
                     f"months / {DAYS_PER_MONTH:g} per day"
+                )
+            elif (
+                is_income
+                and income_policy == "A"
+                and n >= MIN_OCCURRENCES
+                and median_gap <= DRIP_GAP_MAX
+            ):
+                # CHANGE 2: biweekly/irregular income recurs on its ACTUAL cadence,
+                # not a smeared daily drip -- the drip propped up the trough on
+                # non-payday dates and over-projected safe headroom. Landing income
+                # on real ~cadence dates yields a truer (lower) trough between pays.
+                kind = "periodic"
+                period_days = max(1, round(median_gap))
+                recent = _recent_amounts(cfs_sorted, RECENT_N)
+                projected_amount = statistics.fmean(recent) if recent else None
+                amount_basis = (
+                    f"mean of {len(recent)} recent, every ~{period_days}d"
+                    if recent
+                    else "amount unresolved"
                 )
 
         series.append(
@@ -547,6 +569,7 @@ def detect_recurrence(
                 median_gap_days=median_gap,
                 projected_amount=projected_amount,
                 amount_basis=amount_basis,
+                period_days=period_days,
                 cashflows=cfs_sorted,
             )
         )
@@ -614,6 +637,26 @@ def project(
                             s.category, "monthly", True,
                         )
                     )
+        elif s.kind == "periodic":
+            # Recur on the observed cadence, continuing from the last real occurrence.
+            if not s.projected_amount or not s.period_days:
+                continue
+            amt = _sign_for(s.direction) * s.projected_amount
+            anchor = s.cashflows[-1].hit_date
+            k = 1
+            while True:
+                on = anchor + timedelta(days=s.period_days * k)
+                if on > end_date:
+                    break
+                if on >= start_date:
+                    items.append(
+                        ForecastItem(
+                            on, amt,
+                            f"{s.category} (every ~{s.period_days}d {s.event_type})",
+                            s.category, "periodic", True,
+                        )
+                    )
+                k += 1
         elif s.kind == "daily_drip":
             if not s.projected_amount:
                 continue
