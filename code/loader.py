@@ -81,6 +81,14 @@ class Dataset:
     def get_request_row(self, request_id: str) -> Optional[Row]:
         return self._request_by_id.get(request_id)
 
+    def get_profile(self, user_id: str) -> Optional[Row]:
+        """Raw financial_profile row for a user (or None)."""
+        return self._profile_by_user.get(user_id)
+
+    def get_user_events(self, user_id: str) -> List[Row]:
+        """Raw financial_events rows for a user (empty list if none)."""
+        return list(self._events_by_user.get(user_id, []))
+
     def get_request_context(self, request_id: str) -> Dict[str, Any]:
         """Return the RAW joined records for ``request_id`` (no transformation).
 
