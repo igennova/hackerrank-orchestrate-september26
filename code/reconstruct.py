@@ -27,12 +27,24 @@ Spec references (problem_statement.md):
 
 from __future__ import annotations
 
+import statistics
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, timedelta
 from typing import Dict, List, Optional, Tuple
 
 import currency
 from loader import load_dataset
+
+# Forecast horizon and recurrence-detection tunables (kept together for review).
+FORECAST_DAYS = 90
+RECENT_N = 3  # projection amount = mean of this many most-recent occurrences
+MIN_OCCURRENCES = 3  # need this many to call anything recurring
+MONTHLY_GAP_MIN, MONTHLY_GAP_MAX = 26, 32  # median gap window for "monthly"
+MONTHLY_DOM_CONSISTENCY = 0.6  # fraction of occurrences on the modal day-of-month
+DRIP_GAP_MAX = 20  # median gap at/below this (and not monthly) => near-daily drip
+DRIP_MIN_OCCURRENCES = 8  # ...and at least this many samples
+DAYS_PER_MONTH = 30.0  # drip denominator (monthly total spread evenly per day)
 
 # Statuses/dirs the spec tells us to ignore, mapped to a short drop reason.
 # (Pending credits are handled separately because they depend on direction.)
@@ -312,9 +324,325 @@ def reconstruct(user_id: str) -> List[Cashflow]:
     return reconstruct_detailed(user_id).cashflows
 
 
+# ===========================================================================
+# SLICE 2: recurrence detection + forward projection (deterministic)
+# ===========================================================================
+# Blank-amount events are carried forward as flagged/unresolved. They are never
+# zeroed and never used in amount statistics; no vision/LLM is called here.
+
+
+@dataclass
+class RecurringSeries:
+    category: str
+    direction: str
+    event_type: str
+    kind: str  # "monthly" | "daily_drip" | "one_off"
+    occurrences: int
+    day_of_month: Optional[int]  # monthly only
+    median_gap_days: Optional[float]
+    projected_amount: Optional[float]  # per-occurrence (monthly) or per-day (drip)
+    amount_basis: str  # human note: how projected_amount was derived
+    cashflows: List[Cashflow] = field(default_factory=list)
+
+
+@dataclass
+class ForecastItem:
+    on_date: date
+    signed_amount: Optional[float]  # None when a blank-amount event is unresolved
+    label: str
+    category: str
+    kind: str  # "monthly" | "daily_drip" | "one_off"
+    is_estimate: bool  # True for projected/averaged amounts
+    needs_image_amount: bool = False
+
+
+def _sign_for(direction: str) -> int:
+    return -1 if direction == "debit" else 1
+
+
+def _recent_amounts(cfs: List[Cashflow], n: int) -> List[float]:
+    """Amounts of the n most-recent occurrences that actually have a value."""
+    ordered = sorted(cfs, key=lambda c: c.hit_date, reverse=True)
+    vals = [c.original_amount for c in ordered if c.original_amount is not None]
+    return vals[:n]
+
+
+def _monthly_total_recent(cfs: List[Cashflow], n_months: int) -> float:
+    """Mean per-calendar-month spend over the most recent n complete months seen."""
+    by_month: Dict[Tuple[int, int], float] = defaultdict(float)
+    for c in cfs:
+        if c.original_amount is not None:
+            by_month[(c.hit_date.year, c.hit_date.month)] += abs(c.original_amount)
+    if not by_month:
+        return 0.0
+    recent_keys = sorted(by_month)[-n_months:]
+    return statistics.fmean(by_month[k] for k in recent_keys)
+
+
+def detect_recurrence(
+    cashflows: List[Cashflow], income_policy: str = "A"
+) -> List[RecurringSeries]:
+    """Classify each (category, direction) group as monthly / daily_drip / one_off.
+
+    Guiding rule (safer interpretation per spec): "expenses continue unless
+    evidence they stop; income projected only with evidence it continues."
+      - EXPENSES with sufficient history (>=3 occurrences) but a non-clean cadence
+        still drip their monthly average rather than vanishing into one_off.
+      - INCOME is projected only when the evidence supports continuation:
+          policy A -> project all recurring income (monthly series AND near-daily
+                      income drips) -- more generous. DEFAULT.
+          policy B -> project regular monthly income series only; irregular /
+                      freelance income seen only as a historical pattern is NOT
+                      projected (it falls to one_off, so only confirmed future-
+                      dated income events on their settlement date are counted).
+
+    Policy A is the default: an A/B tiebreaker on the 25 samples tied on
+    affordability_status, and the one decisive row (request_09, a freelancer with
+    ground-truth affordable_now) is reproduced only by A. REVISIT this choice once
+    the decision engine and image-amount resolution exist -- re-run the tiebreaker
+    and measure amount_safe_to_pay and earliest_date_for_full_payment too, not just
+    affordability_status.
+    """
+    if income_policy not in ("A", "B"):
+        raise ValueError(f"income_policy must be 'A' or 'B', got {income_policy!r}")
+
+    groups: Dict[Tuple[str, str], List[Cashflow]] = defaultdict(list)
+    for cf in cashflows:
+        groups[(cf.category, cf.direction)].append(cf)
+
+    series: List[RecurringSeries] = []
+    for (category, direction), cfs in groups.items():
+        cfs_sorted = sorted(cfs, key=lambda c: c.hit_date)
+        dates = [c.hit_date for c in cfs_sorted]
+        n = len(dates)
+        event_type = Counter(c.event_type for c in cfs_sorted).most_common(1)[0][0]
+
+        gaps = [(b - a).days for a, b in zip(dates, dates[1:])]
+        median_gap = statistics.median(gaps) if gaps else None
+        dom_counts = Counter(d.day for d in dates)
+        modal_dom, modal_count = dom_counts.most_common(1)[0]
+
+        kind = "one_off"
+        day_of_month: Optional[int] = None
+        projected_amount: Optional[float] = None
+        amount_basis = "one-off; carried at own date"
+
+        if n >= MIN_OCCURRENCES and median_gap is not None:
+            is_monthly = (
+                MONTHLY_GAP_MIN <= median_gap <= MONTHLY_GAP_MAX
+                and modal_count / n >= MONTHLY_DOM_CONSISTENCY
+            )
+            # Should this non-monthly series drip? Expenses always do (they
+            # continue unless evidence they stop). Income drips only under policy
+            # A and only when near-daily (evidence of ongoing frequent income).
+            if is_monthly:
+                is_drip = False
+            elif direction == "debit":
+                is_drip = True  # DECISION 2: expenses continue -> drip monthly avg
+            else:  # income
+                is_drip = (
+                    income_policy == "A"
+                    and median_gap <= DRIP_GAP_MAX
+                    and n >= DRIP_MIN_OCCURRENCES
+                )
+
+            if is_monthly:
+                kind = "monthly"
+                day_of_month = modal_dom
+                recent = _recent_amounts(cfs_sorted, RECENT_N)
+                if recent and len({round(a, 2) for a in recent}) == 1:
+                    projected_amount = recent[0]
+                    amount_basis = f"fixed amount ({len(recent)} recent equal)"
+                elif recent:
+                    projected_amount = statistics.fmean(recent)
+                    amount_basis = f"mean of {len(recent)} recent occurrences"
+                else:
+                    amount_basis = "amount unresolved (blank occurrences)"
+            elif is_drip:
+                kind = "daily_drip"
+                monthly_total = _monthly_total_recent(cfs_sorted, RECENT_N)
+                projected_amount = monthly_total / DAYS_PER_MONTH
+                amount_basis = (
+                    f"mean monthly total {monthly_total:.2f} over recent "
+                    f"months / {DAYS_PER_MONTH:g} per day"
+                )
+
+        series.append(
+            RecurringSeries(
+                category=category,
+                direction=direction,
+                event_type=event_type,
+                kind=kind,
+                occurrences=n,
+                day_of_month=day_of_month,
+                median_gap_days=median_gap,
+                projected_amount=projected_amount,
+                amount_basis=amount_basis,
+                cashflows=cfs_sorted,
+            )
+        )
+    series.sort(key=lambda s: (s.kind, s.category, s.direction))
+    return series
+
+
+def _month_iter(start: date, end: date):
+    """Yield (year, month) from start's month through end's month inclusive."""
+    y, m = start.year, start.month
+    while (y, m) <= (end.year, end.month):
+        yield y, m
+        m += 1
+        if m == 13:
+            y, m = y + 1, 1
+
+
+def _clamped_date(year: int, month: int, day: int) -> date:
+    """Build a date, clamping the day to the month's last day (e.g. dom 31 -> 30)."""
+    if month == 12:
+        last = 31
+    else:
+        last = (date(year, month + 1, 1) - timedelta(days=1)).day
+    return date(year, month, min(day, last))
+
+
+def project(
+    user_id: str,
+    start_date: date,
+    horizon_days: int = FORECAST_DAYS,
+    income_policy: str = "A",
+) -> List[ForecastItem]:
+    """Forecast dated cashflows over [start_date, start_date + horizon_days].
+
+    Dated obligations (monthly series, one-offs) are start-INCLUSIVE: an item due
+    on ``start_date`` itself (e.g. rent due on the request date) is reserved,
+    because the starting balance is taken as-of the morning of ``start_date``
+    before that day's dated commitments clear. Near-daily EXPENSE drips start the
+    day AFTER ``start_date`` -- the request day's variable spend is treated as
+    already reflected in the current balance, so we do not double-count it.
+    """
+    cashflows = reconstruct(user_id)
+    series = detect_recurrence(cashflows, income_policy=income_policy)
+    end_date = start_date + timedelta(days=horizon_days)
+
+    items: List[ForecastItem] = []
+    for s in series:
+        if s.kind == "monthly":
+            for year, month in _month_iter(start_date, end_date):
+                on = _clamped_date(year, month, s.day_of_month)
+                if not (start_date <= on <= end_date):
+                    continue
+                if s.projected_amount is None:
+                    items.append(
+                        ForecastItem(
+                            on, None, f"{s.category} (recurring, amount unresolved)",
+                            s.category, "monthly", True, needs_image_amount=True,
+                        )
+                    )
+                else:
+                    amt = _sign_for(s.direction) * s.projected_amount
+                    items.append(
+                        ForecastItem(
+                            on, amt, f"{s.category} (monthly {s.event_type})",
+                            s.category, "monthly", True,
+                        )
+                    )
+        elif s.kind == "daily_drip":
+            if not s.projected_amount:
+                continue
+            amt = _sign_for(s.direction) * s.projected_amount
+            day = start_date + timedelta(days=1)
+            while day <= end_date:
+                items.append(
+                    ForecastItem(
+                        day, amt, f"{s.category} (daily drip)", s.category,
+                        "daily_drip", True,
+                    )
+                )
+                day += timedelta(days=1)
+        else:  # one_off: include only its own in-window occurrences
+            for cf in s.cashflows:
+                if start_date <= cf.hit_date <= end_date:
+                    items.append(
+                        ForecastItem(
+                            cf.hit_date, cf.signed_amount,
+                            f"{cf.category} (one-off {cf.event_type})", cf.category,
+                            "one_off", False, needs_image_amount=cf.needs_image_amount,
+                        )
+                    )
+
+    items.sort(key=lambda it: (it.on_date, -(it.signed_amount or 0)))
+    return items
+
+
+def balance_trace(
+    user_id: str,
+    start_date: date,
+    start_balance: float,
+    horizon_days: int = FORECAST_DAYS,
+    income_policy: str = "A",
+) -> Tuple[List[Tuple[date, float]], float, date]:
+    """Daily running balance from start_balance; returns (series, trough, trough_date).
+
+    Blank-amount (unresolved) forecast items are treated as 0 in the numeric trace
+    ONLY so the trace can run; they remain flagged upstream and are not real zeros.
+    """
+    items = project(user_id, start_date, horizon_days, income_policy=income_policy)
+    by_day: Dict[date, float] = defaultdict(float)
+    for it in items:
+        by_day[it.on_date] += it.signed_amount or 0.0
+
+    # Opening balance is as-of the morning of start_date; then apply each day's
+    # net flows (start-inclusive, so same-day dated obligations are reserved).
+    running = start_balance
+    trough = start_balance
+    trough_date = start_date
+    trace: List[Tuple[date, float]] = []
+    day = start_date
+    end_date = start_date + timedelta(days=horizon_days)
+    while day <= end_date:
+        running += by_day.get(day, 0.0)
+        trace.append((day, running))
+        if running < trough:
+            trough = running
+            trough_date = day
+        day += timedelta(days=1)
+    return trace, trough, trough_date
+
+
 # ---------------------------------------------------------------------------
 # Demo / manual review
 # ---------------------------------------------------------------------------
+def _print_classification(user_id: str) -> None:
+    series = detect_recurrence(reconstruct(user_id))
+    print(f"\nRecurrence classification for {user_id}:")
+    print(
+        f"  {'category':<16}{'dir':<7}{'kind':<12}{'n':>4}  {'dom':>4} "
+        f"{'gap':>5}  {'proj_amount':>13}  basis"
+    )
+    for s in series:
+        dom = "" if s.day_of_month is None else str(s.day_of_month)
+        gap = "" if s.median_gap_days is None else f"{s.median_gap_days:g}"
+        amt = "" if s.projected_amount is None else f"{s.projected_amount:,.2f}"
+        print(
+            f"  {s.category:<16}{s.direction:<7}{s.kind:<12}{s.occurrences:>4}  "
+            f"{dom:>4} {gap:>5}  {amt:>13}  {s.amount_basis}"
+        )
+
+
+def _print_trough(user_id: str, start: date, start_balance: float, floor: float) -> None:
+    trace, trough, trough_date = balance_trace(user_id, start, start_balance)
+    print(f"\n{user_id} 90-day balance trace from {start} (start balance {start_balance:,.2f}):")
+    print(f"  LOWEST point: {trough:,.2f} on {trough_date}")
+    print(f"  minimum floor: {floor:,.2f}  ->  {'ABOVE floor' if trough >= floor else 'BELOW floor'}")
+    # show the days around the trough for eyeballing
+    lo = trough_date - timedelta(days=3)
+    hi = trough_date + timedelta(days=2)
+    print("  context around trough:")
+    for d, bal in trace:
+        if lo <= d <= hi:
+            print(f"     {d}  {bal:,.2f}")
+
+
+
 def _print_summary(result: ReconstructionResult, full: bool = False) -> None:
     print("=" * 78)
     print(f"USER {result.user_id}  (home currency: {result.home_currency})")
@@ -344,8 +672,14 @@ def _print_summary(result: ReconstructionResult, full: bool = False) -> None:
 
 
 if __name__ == "__main__":
-    # Required: user_09 (fully clean) printed in full.
-    _print_summary(reconstruct_detailed("user_09"), full=True)
+    # --- Slice 2 verification -------------------------------------------------
+    print("### user_19 recurrence + projection (hand-trace check) ###")
+    _print_classification("user_19")
+    _print_trough("user_19", date(2024, 9, 4), 199545.0, 92800.0)
+
+    print("\n\n### user_09 recurrence + projection (stays above floor) ###")
+    _print_classification("user_09")
+    _print_trough("user_09", date(2026, 7, 4), 2231.10, 600.0)
 
     # Extra: prove the drop + merge paths actually fire.
     print("\n\n### Extra users to exercise filter + dedup paths ###\n")
