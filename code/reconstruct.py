@@ -27,6 +27,7 @@ Spec references (problem_statement.md):
 
 from __future__ import annotations
 
+import os
 import statistics
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
@@ -34,7 +35,15 @@ from datetime import date, timedelta
 from typing import Dict, List, Optional, Tuple
 
 import currency
-from loader import load_dataset
+from loader import MEDIA_IMAGES_DIR, load_dataset
+
+# Blank-amount image resolution (the one non-deterministic seam). Opt-in; when off,
+# blank-amount events stay flagged/unresolved and the pipeline still runs.
+RESOLVE_IMAGES = True
+# event_id -> resolved signed home-currency amount, or None if unresolved. Persists
+# for the process so the many reconstruct() calls resolve each event at most once
+# (vision.py adds its own persistent per-image cache on top).
+_RESOLVED_CACHE: Dict[str, Optional[float]] = {}
 
 # Forecast horizon and recurrence-detection tunables (kept together for review).
 FORECAST_DAYS = 90
@@ -310,6 +319,7 @@ def reconstruct_detailed(user_id: str) -> ReconstructionResult:
         survivors.append(_normalize(ev, home_currency, protect))
 
     cashflows, merged = _dedupe(survivors)
+    _resolve_blank_amounts(cashflows, home_currency)
 
     return ReconstructionResult(
         user_id=user_id,
@@ -319,6 +329,63 @@ def reconstruct_detailed(user_id: str) -> ReconstructionResult:
         dropped=dropped,
         merged=merged,
     )
+
+
+def _resolve_blank_amounts(cashflows: List[Cashflow], home_currency: str) -> None:
+    """Fill blank-amount events from their linked image (the vision seam).
+
+    For each cashflow flagged needs_image_amount, resolve the amount from its image
+    (converting to home currency if needed) and clear the flag. If resolution yields
+    nothing, the event stays flagged and is carried as before. Results are cached per
+    event so repeated reconstruct() calls never re-invoke the model.
+    """
+    if not RESOLVE_IMAGES:
+        return
+    blanks = [cf for cf in cashflows if cf.needs_image_amount]
+    if not blanks:
+        return
+
+    ds = load_dataset(verbose=False)
+    for cf in blanks:
+        if cf.event_id not in _RESOLVED_CACHE:
+            _RESOLVED_CACHE[cf.event_id] = _resolve_one(cf, home_currency, ds)
+        signed = _RESOLVED_CACHE[cf.event_id]
+        if signed is not None:
+            cf.signed_amount = signed
+            cf.needs_image_amount = False
+
+
+def _resolve_one(cf: Cashflow, home_currency: str, ds) -> Optional[float]:
+    image = ds.get_image_for_event(cf.event_id)
+    if image is None:
+        return None
+    import vision  # lazy: keeps the deterministic core import-clean and network-free
+
+    path = os.path.join(MEDIA_IMAGES_DIR, f"{image['image_id']}.png")
+    try:
+        res = vision.resolve_amount(
+            path,
+            {
+                "description": cf.description,
+                "currency": cf.original_currency,
+                "image_id": image["image_id"],
+            },
+        )
+    except Exception:
+        return None
+    amount = res.get("amount")
+    if amount is None:
+        return None
+    # Convert to home currency using the event's declared currency (image confirms
+    # the figure); use the event's own date for the rate.
+    if cf.original_currency != home_currency:
+        rate, _rate_date = currency.lookup_rate(
+            cf.original_currency, home_currency, cf.hit_date
+        )
+        magnitude = amount * rate
+    else:
+        magnitude = amount
+    return -magnitude if cf.direction == "debit" else magnitude
 
 
 def reconstruct(user_id: str) -> List[Cashflow]:

@@ -1,0 +1,16 @@
+{"ts": "2026-09-13T16:23:24+0530", "image_id": "image_06", "provider": "openai", "model": "gpt-4o", "prompt_tokens": 940, "completion_tokens": 14, "total_tokens": 954, "estimated_cost_usd": 0.00249}
+{"ts": "2026-09-13T16:23:25+0530", "image_id": "image_07", "provider": "openai", "model": "gpt-4o", "prompt_tokens": 940, "completion_tokens": 14, "total_tokens": 954, "estimated_cost_usd": 0.00249}
+{"ts": "2026-09-13T16:23:27+0530", "image_id": "image_08", "provider": "openai", "model": "gpt-4o", "prompt_tokens": 1280, "completion_tokens": 14, "total_tokens": 1294, "estimated_cost_usd": 0.00334}
+{"ts": "2026-09-13T16:23:29+0530", "image_id": "image_09", "provider": "openai", "model": "gpt-4o", "prompt_tokens": 1280, "completion_tokens": 13, "total_tokens": 1293, "estimated_cost_usd": 0.00333}
+{"ts": "2026-09-13T16:23:31+0530", "image_id": "image_10", "provider": "openai", "model": "gpt-4o", "prompt_tokens": 1281, "completion_tokens": 16, "total_tokens": 1297, "estimated_cost_usd": 0.003363}
+{"ts": "2026-09-13T16:23:32+0530", "image_id": "image_11", "provider": "openai", "model": "gpt-4o", "prompt_tokens": 1280, "completion_tokens": 14, "total_tokens": 1294, "estimated_cost_usd": 0.00334}
+{"ts": "2026-09-13T16:23:34+0530", "image_id": "image_12", "provider": "openai", "model": "gpt-4o", "prompt_tokens": 599, "completion_tokens": 14, "total_tokens": 613, "estimated_cost_usd": 0.001638}
+{"ts": "2026-09-13T16:23:36+0530", "image_id": "image_13", "provider": "openai", "model": "gpt-4o", "prompt_tokens": 1280, "completion_tokens": 14, "total_tokens": 1294, "estimated_cost_usd": 0.00334}
+{"ts": "2026-09-13T16:23:37+0530", "image_id": "image_14", "provider": "openai", "model": "gpt-4o", "prompt_tokens": 599, "completion_tokens": 14, "total_tokens": 613, "estimated_cost_usd": 0.001638}
+{"ts": "2026-09-13T16:23:39+0530", "image_id": "image_15", "provider": "openai", "model": "gpt-4o", "prompt_tokens": 940, "completion_tokens": 14, "total_tokens": 954, "estimated_cost_usd": 0.00249}
+{"ts": "2026-09-13T16:23:41+0530", "image_id": "image_16", "provider": "openai", "model": "gpt-4o", "prompt_tokens": 1281, "completion_tokens": 15, "total_tokens": 1296, "estimated_cost_usd": 0.003353}
+{"ts": "2026-09-13T16:24:05+0530", "image_id": "image_01", "provider": "openai", "model": "gpt-4o", "prompt_tokens": 944, "completion_tokens": 15, "total_tokens": 959, "estimated_cost_usd": 0.00251}
+{"ts": "2026-09-13T16:24:06+0530", "image_id": "image_02", "provider": "openai", "model": "gpt-4o", "prompt_tokens": 940, "completion_tokens": 14, "total_tokens": 954, "estimated_cost_usd": 0.00249}
+{"ts": "2026-09-13T16:24:08+0530", "image_id": "image_03", "provider": "openai", "model": "gpt-4o", "prompt_tokens": 1282, "completion_tokens": 14, "total_tokens": 1296, "estimated_cost_usd": 0.003345}
+{"ts": "2026-09-13T16:24:11+0530", "image_id": "image_04", "provider": "openai", "model": "gpt-4o", "prompt_tokens": 940, "completion_tokens": 14, "total_tokens": 954, "estimated_cost_usd": 0.00249}
+{"ts": "2026-09-13T16:24:12+0530", "image_id": "image_05", "provider": "openai", "model": "gpt-4o", "prompt_tokens": 1280, "completion_tokens": 15, "total_tokens": 1295, "estimated_cost_usd": 0.00335}

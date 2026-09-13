@@ -77,6 +77,13 @@ class Dataset:
         for row in self.request_payment_options:
             self._options_by_request.setdefault(row["request_id"], []).append(row)
 
+        # related_event_id -> image row (for blank-amount resolution).
+        self._image_by_event: Dict[str, Row] = {}
+        for row in self.images:
+            related = row.get("related_event_id") or ""
+            if related:
+                self._image_by_event.setdefault(related, row)
+
     # -- accessors ----------------------------------------------------------
     def get_request_row(self, request_id: str) -> Optional[Row]:
         return self._request_by_id.get(request_id)
@@ -88,6 +95,10 @@ class Dataset:
     def get_user_events(self, user_id: str) -> List[Row]:
         """Raw financial_events rows for a user (empty list if none)."""
         return list(self._events_by_user.get(user_id, []))
+
+    def get_image_for_event(self, event_id: str) -> Optional[Row]:
+        """Image row whose related_event_id is this event (or None)."""
+        return self._image_by_event.get(event_id)
 
     def get_request_context(self, request_id: str) -> Dict[str, Any]:
         """Return the RAW joined records for ``request_id`` (no transformation).
