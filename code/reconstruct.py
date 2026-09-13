@@ -68,6 +68,7 @@ class Cashflow:
     signed_amount: Optional[float]  # None when the amount must come from an image
     home_currency: str
     category: str
+    description: str
     is_essential: bool
     flexibility: str  # raw value: fixed | reducible | stoppable | reducible_or_stoppable
     can_reduce: bool
@@ -171,6 +172,7 @@ def _normalize(ev: Dict[str, str], home_currency: str, protect: set) -> Cashflow
         signed_amount=signed_amount,
         home_currency=home_currency,
         category=ev["category"],
+        description=ev["description"],
         is_essential=ev["category"] in protect,
         flexibility=ev["flexibility"],
         can_reduce=can_reduce,
@@ -571,6 +573,77 @@ def project(
 
     items.sort(key=lambda it: (it.on_date, -(it.signed_amount or 0)))
     return items
+
+
+@dataclass
+class Forecast:
+    """Daily forecast primitive: balances, trough, and suffix-minimums.
+
+    ``suffix_min(d)`` is the lowest balance over [d, end]; paying an amount X as a
+    single lump on day d keeps the plan safe iff ``suffix_min(d) - X >= minimum``.
+    """
+
+    start_date: date
+    days: List[date]
+    balances: Dict[date, float]
+    trough: float
+    trough_date: date
+    _suffix_min: Dict[date, float]
+
+    def suffix_min(self, d: date) -> float:
+        return self._suffix_min[d]
+
+
+def build_forecast(
+    user_id: str,
+    start_date: date,
+    start_balance: float,
+    horizon_days: int = FORECAST_DAYS,
+    income_policy: str = "A",
+    extra_payments: Optional[List[Tuple[date, float]]] = None,
+    series_scale: Optional[Dict[str, float]] = None,
+) -> Forecast:
+    """Forecast daily balances, optionally with hypothetical payments and
+    spending-change overrides.
+
+    ``extra_payments`` are (date, amount) debits toward a request.
+    ``series_scale`` maps an expense category to a multiplier applied to its
+    projected (negative) items: 0.0 models stopping the series; a fraction models
+    reducing it. Only expense (debit) items are scaled.
+    """
+    items = project(user_id, start_date, horizon_days, income_policy=income_policy)
+    by_day: Dict[date, float] = defaultdict(float)
+    for it in items:
+        amt = it.signed_amount or 0.0
+        if series_scale and amt < 0 and it.category in series_scale:
+            amt *= series_scale[it.category]
+        by_day[it.on_date] += amt
+    if extra_payments:
+        for pay_date, pay_amt in extra_payments:
+            by_day[pay_date] += -abs(pay_amt)
+
+    days = [start_date + timedelta(days=i) for i in range(horizon_days + 1)]
+    balances: Dict[date, float] = {}
+    running = start_balance
+    for d in days:
+        running += by_day.get(d, 0.0)
+        balances[d] = running
+
+    suffix: Dict[date, float] = {}
+    m = float("inf")
+    for d in reversed(days):
+        m = min(m, balances[d])
+        suffix[d] = m
+
+    trough_date = min(days, key=lambda d: balances[d])
+    return Forecast(
+        start_date=start_date,
+        days=days,
+        balances=balances,
+        trough=balances[trough_date],
+        trough_date=trough_date,
+        _suffix_min=suffix,
+    )
 
 
 def balance_trace(
