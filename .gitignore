@@ -9,3 +9,6 @@ venv/
 
 # Chat transcript (uploaded separately as chat_transcript at submission)
 log.txt
+
+# Submission build artifacts
+*.zip
